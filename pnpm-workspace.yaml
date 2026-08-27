@@ -1,0 +1,25 @@
+packages:
+  - packages/*
+engineStrict: true
+linkWorkspacePackages: true
+autoInstallPeers: false
+strictPeerDependencies: true
+allowBuilds:
+  nx: true
+minimumReleaseAgeExclude:
+  - "@nx/devkit@23.1.2"
+  - "@nx/eslint-plugin@23.1.2"
+  - "@nx/js@23.1.2"
+  - "@nx/nx-darwin-arm64@23.1.2"
+  - "@nx/nx-darwin-x64@23.1.2"
+  - "@nx/nx-freebsd-x64@23.1.2"
+  - "@nx/nx-linux-arm-gnueabihf@23.1.2"
+  - "@nx/nx-linux-arm64-gnu@23.1.2"
+  - "@nx/nx-linux-arm64-musl@23.1.2"
+  - "@nx/nx-linux-x64-gnu@23.1.2"
+  - "@nx/nx-linux-x64-musl@23.1.2"
+  - "@nx/nx-win32-arm64-msvc@23.1.2"
+  - "@nx/nx-win32-x64-msvc@23.1.2"
+  - "@nx/workspace@23.1.2"
+  - "@types/node@26.4.0"
+  - nx@23.1.2

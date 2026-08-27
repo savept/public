@@ -1,0 +1,29 @@
+{
+  "name": "@savept/public-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "nx run-many -t build",
+    "check": "nx run-many -t lint typecheck test build",
+    "format:check": "prettier --check .",
+    "lint": "nx run-many -t lint",
+    "test": "nx run-many -t test",
+    "typecheck": "nx run-many -t typecheck"
+  },
+  "devDependencies": {
+    "@nx/devkit": "23.1.2",
+    "@nx/eslint-plugin": "23.1.2",
+    "@nx/js": "23.1.2",
+    "@types/node": "26.4.0",
+    "eslint": "10.9.1",
+    "nx": "23.1.2",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.68.0",
+    "vitest": "4.1.11"
+  }
+}
