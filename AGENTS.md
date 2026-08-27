@@ -22,6 +22,6 @@ This repository is public. Assume every committed byte, Git object, build log, f
 
 Public npm packages are built and published only from this repository's CI using npm trusted publishing and provenance. Before release, inspect the packed artifact and test it in a clean consumer. The private product repository has no publication authority for these packages.
 
-## Composed development
+## Product integration
 
-This repository may appear at `product/public/` as a Git submodule. Commit and push changes here before updating the private repository's submodule pointer. A private commit cannot push this repository's commits.
+This repository is never nested inside the private product workspace. Product integration happens through reviewed npm releases or prereleases with explicit semver versions. Do not add source-path links, Git submodules, or cross-repository TypeScript references.
