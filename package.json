@@ -11,6 +11,8 @@
     "check": "nx run-many -t lint typecheck test build",
     "format:check": "prettier --check .",
     "lint": "nx run-many -t lint",
+    "release:validate": "vitest run tools/release/release-validation.test.mjs",
+    "release:current": "node tools/release/validate.mjs --current",
     "test": "nx run-many -t test",
     "typecheck": "nx run-many -t typecheck"
   },
@@ -20,10 +22,12 @@
     "@nx/js": "23.1.2",
     "@types/node": "26.4.0",
     "eslint": "10.9.1",
+    "minimatch": "10.2.5",
     "nx": "23.1.2",
     "prettier": "3.9.6",
     "typescript": "5.9.3",
     "typescript-eslint": "8.68.0",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "yaml": "2.9.0"
   }
 }

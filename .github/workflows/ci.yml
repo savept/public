@@ -31,3 +31,9 @@ jobs:
 
       - name: Lint, typecheck, test, and build
         run: pnpm check
+
+      - name: Validate release policy and artifacts
+        run: pnpm release:validate
+
+      - name: Validate current release configuration is safely blocked
+        run: pnpm release:current
