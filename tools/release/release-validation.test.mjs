@@ -20,14 +20,20 @@ function createWorkspace() {
   return workspaceRoot;
 }
 
-function runValidation(workspaceRoot) {
+function runValidation(workspaceRoot, options = {}) {
   try {
     const output = execFileSync(
       process.execPath,
-      ["tools/release/validate.mjs", "--root", workspaceRoot],
+      [
+        "tools/release/validate.mjs",
+        "--root",
+        workspaceRoot,
+        ...(options.current ? ["--current"] : []),
+      ],
       {
         cwd: process.cwd(),
         encoding: "utf8",
+        env: { ...process.env, ...options.env },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -708,6 +714,44 @@ describe("release validation", () => {
     expect(result.output).toContain(
       "RELEASE_POLICY_BLOCKED: pnpm workspace resolves to zero package manifests",
     );
+  });
+
+  it("does not hide a non-private package in a configured tmp workspace directory", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot);
+    writeFileSync(
+      join(workspaceRoot, "pnpm-workspace.yaml"),
+      'packages: ["tmp/*"]\n',
+    );
+    writeWorkspacePackage(workspaceRoot, "tmp/unlisted", {
+      name: "@savept/tmp-unlisted",
+      private: false,
+      version: "1.0.0",
+    });
+
+    const result = runValidation(workspaceRoot, { current: true });
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: non-private package @savept/tmp-unlisted is not allow-listed",
+    );
+  });
+
+  it("does not expose parent CI secrets to the installed package import", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      files: {
+        "dist/index.js":
+          'if (process.env.SAVEPT_RELEASE_TEST_SECRET) throw new Error("secret leaked");\nexport const packageValue = "clean";\n',
+      },
+    });
+
+    const result = runValidation(workspaceRoot, {
+      env: { SAVEPT_RELEASE_TEST_SECRET: "sentinel" },
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output).toContain("packed and installed cleanly");
   });
 
   it("rejects a workflow publish command even when --ignore-scripts and --provenance are supplied", () => {

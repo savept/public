@@ -18,7 +18,7 @@ import { isAlias, isMap, isSeq, parseDocument } from "yaml";
 class PolicyError extends Error {}
 const npmExecutable = join(dirname(process.execPath), "npm");
 const npmRegistry = "https://registry.npmjs.org/";
-const ignoredWorkspaceDirectories = [".git", "dist", "node_modules", "tmp"];
+const ignoredWorkspaceDirectories = [".git", "node_modules"];
 const forbiddenLifecycleScripts = new Set([
   "preinstall",
   "install",
@@ -438,7 +438,15 @@ function validateCleanConsumer(candidate, tarball, inspectedFiles) {
         "--eval",
         `await import(${JSON.stringify(candidate.manifest.name)})`,
       ],
-      { cwd: tempRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      {
+        cwd: tempRoot,
+        encoding: "utf8",
+        env: {
+          HOME: join(tempRoot, "home"),
+          PATH: process.env.PATH ?? "",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
     );
   } finally {
     rmSync(tempRoot, { force: true, recursive: true });
