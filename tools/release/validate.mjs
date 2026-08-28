@@ -450,28 +450,43 @@ function inspectTarball(candidate, tarball, expectedFiles) {
 }
 function nodeRuntimeEntries(exports) {
   const entries = [];
-  const addConditions = (specifier, value) => {
-    if (typeof value === "string") {
-      entries.push({ mode: "import", specifier });
-      return;
-    }
+  const resolveCondition = (value, mode) => {
+    if (typeof value === "string") return value;
     if (!value || typeof value !== "object" || Array.isArray(value))
       fail("exports has an unsupported Node runtime shape");
     const keys = Object.keys(value);
     if (keys.length === 0) fail("exports has no Node runtime target");
     for (const key of keys) {
-      if (!["default", "import", "require", "types"].includes(key))
+      if (key === "node-addons")
+        fail("node-addons exports are unsupported for Node runtime validation");
+      if (!["default", "import", "node", "require", "types"].includes(key))
         fail(
           `exports condition ${key} is unsupported for Node runtime validation`,
         );
-      if (typeof value[key] !== "string")
+      if (typeof value[key] !== "string" && typeof value[key] !== "object")
         fail("exports has an unsupported Node runtime target");
-      if (key === "types") continue;
-      entries.push({
-        mode: key === "require" ? "require" : "import",
-        specifier,
-      });
+      if (
+        value[key] &&
+        typeof value[key] === "object" &&
+        Array.isArray(value[key])
+      )
+        fail("exports has an unsupported Node runtime target");
     }
+    for (const [key, target] of Object.entries(value)) {
+      if (key === "node" || key === mode || key === "default")
+        return resolveCondition(target, mode);
+    }
+    return undefined;
+  };
+  const addConditions = (specifier, value) => {
+    if (typeof value === "string") {
+      entries.push({ mode: "import", specifier });
+      return;
+    }
+    const importTarget = resolveCondition(value, "import");
+    const requireTarget = resolveCondition(value, "require");
+    if (importTarget) entries.push({ mode: "import", specifier });
+    if (requireTarget) entries.push({ mode: "require", specifier });
   };
   if (typeof exports === "string") {
     addConditions(".", exports);
@@ -486,8 +501,10 @@ function nodeRuntimeEntries(exports) {
       (key) =>
         key === "default" ||
         key === "import" ||
+        key === "node" ||
         key === "require" ||
-        key === "types",
+        key === "types" ||
+        key === "node-addons",
     );
     if (!subpaths && !conditions)
       fail("exports mixes unsupported subpath and condition shapes");

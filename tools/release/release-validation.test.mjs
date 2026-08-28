@@ -720,6 +720,55 @@ describe("release validation", () => {
     expect(runValidation(workspaceRoot).status).toBe(1);
   });
 
+  it("resolves a nested Node import condition from the installed tarball", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      expectedFiles: [
+        "LICENSE",
+        "dist/broken-root.js",
+        "dist/index.d.ts",
+        "dist/index.js",
+        "dist/node-default.cjs",
+        "dist/node.js",
+        "package.json",
+      ],
+      files: {
+        "dist/broken-root.js": "export const = ;\n",
+        "dist/node-default.cjs":
+          'module.exports = { runtime: "node-default" };\n',
+        "dist/node.js": 'export const runtime = "node";\n',
+      },
+      manifest: {
+        exports: {
+          ".": {
+            node: {
+              import: "./dist/node.js",
+              default: "./dist/node-default.cjs",
+            },
+            default: "./dist/broken-root.js",
+            types: "./dist/index.d.ts",
+          },
+        },
+      },
+    });
+
+    expect(runValidation(workspaceRoot).status).toBe(0);
+  });
+
+  it("rejects node-addons exports because they are not safely executable in Node validation", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      manifest: { exports: { ".": { "node-addons": "./dist/index.js" } } },
+    });
+
+    const result = runValidation(workspaceRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: node-addons exports are unsupported",
+    );
+  });
+
   it("discovers packages matched by packages/** without parsing unrelated YAML lists", () => {
     const workspaceRoot = createWorkspace();
     writeReleaseFixture(workspaceRoot);
