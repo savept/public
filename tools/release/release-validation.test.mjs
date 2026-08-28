@@ -294,7 +294,7 @@ describe("release validation", () => {
 
     expect(result.status).toBe(1);
     expect(result.output).toContain(
-      "RELEASE_POLICY_BLOCKED: duplicate workspace package name",
+      "RELEASE_POLICY_BLOCKED: duplicate repository package name",
     );
   });
 
@@ -598,6 +598,40 @@ describe("release validation", () => {
     );
   });
 
+  it.each([
+    "https://savept.internal.example/token",
+    "https://internal.savept.example/token",
+    "https://savept.private.example/token",
+    "https://private.savept.example/token",
+  ])(
+    "rejects a private Savept hostname regardless of label order: %s",
+    (url) => {
+      const workspaceRoot = createWorkspace();
+      writeReleaseFixture(workspaceRoot, {
+        files: { "dist/index.js": `export const endpoint = "${url}";\n` },
+      });
+
+      const result = runValidation(workspaceRoot);
+
+      expect(result.status).toBe(1);
+      expect(result.output).toContain(
+        "RELEASE_POLICY_BLOCKED: private Savept hostname",
+      );
+    },
+  );
+
+  it("allows an ordinary public Savept hostname", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      files: {
+        "dist/index.js":
+          'export const endpoint = "https://api.savept.example/public";\n',
+      },
+    });
+
+    expect(runValidation(workspaceRoot).status).toBe(0);
+  });
+
   it.each(["mts", "cts"])(
     "rejects allow-listed packed .%s source leakage",
     (extension) => {
@@ -635,6 +669,55 @@ describe("release validation", () => {
     });
 
     expect(runValidation(workspaceRoot).status).toBe(0);
+  });
+
+  it("imports every Node-runtime subpath export from the installed tarball", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      expectedFiles: [
+        "LICENSE",
+        "dist/broken.js",
+        "dist/index.d.ts",
+        "dist/index.js",
+        "package.json",
+      ],
+      files: { "dist/broken.js": "export const = ;\n" },
+      manifest: {
+        exports: {
+          ".": { import: "./dist/index.js", types: "./dist/index.d.ts" },
+          "./broken": "./dist/broken.js",
+        },
+      },
+    });
+
+    expect(runValidation(workspaceRoot).status).toBe(1);
+  });
+
+  it("requires every CommonJS export target from the installed tarball", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      expectedFiles: [
+        "LICENSE",
+        "dist/index.cjs",
+        "dist/index.d.ts",
+        "dist/index.js",
+        "package.json",
+      ],
+      files: {
+        "dist/index.cjs": 'throw new Error("broken require target");\n',
+      },
+      manifest: {
+        exports: {
+          ".": {
+            import: "./dist/index.js",
+            require: "./dist/index.cjs",
+            types: "./dist/index.d.ts",
+          },
+        },
+      },
+    });
+
+    expect(runValidation(workspaceRoot).status).toBe(1);
   });
 
   it("discovers packages matched by packages/** without parsing unrelated YAML lists", () => {
@@ -676,7 +759,7 @@ describe("release validation", () => {
     );
     writeWorkspacePackage(workspaceRoot, "packages/excluded/private-looking", {
       name: "@savept/hidden-public",
-      private: false,
+      private: true,
       version: "1.0.0",
     });
 
@@ -716,9 +799,65 @@ describe("release validation", () => {
     );
   });
 
-  it("does not hide a non-private package in a configured tmp workspace directory", () => {
+  it("rejects a non-private manifest outside the configured workspace in current validation", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, { manifest: { private: true } });
+    writeFileSync(
+      join(workspaceRoot, "release", "allow-list.json"),
+      JSON.stringify({ packages: [], version: 1 }),
+    );
+    writeWorkspacePackage(workspaceRoot, "scratch/not-a-workspace", {
+      name: "@savept/unscanned-public",
+      private: false,
+      version: "1.0.0",
+    });
+
+    const result = runValidation(workspaceRoot, { current: true });
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: non-workspace package @savept/unscanned-public must be private",
+    );
+  });
+
+  it("rejects a non-private manifest outside the configured workspace in full validation", () => {
     const workspaceRoot = createWorkspace();
     writeReleaseFixture(workspaceRoot);
+    writeWorkspacePackage(workspaceRoot, "scratch/not-a-workspace", {
+      name: "@savept/unscanned-public",
+      private: false,
+      version: "1.0.0",
+    });
+
+    const result = runValidation(workspaceRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: non-workspace package @savept/unscanned-public must be private",
+    );
+  });
+
+  it("rejects browser-only exports rather than executing them as Node code", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, {
+      manifest: { exports: { ".": { browser: "./dist/index.js" } } },
+    });
+
+    const result = runValidation(workspaceRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: exports condition",
+    );
+  });
+
+  it("does not hide a non-private package in a configured tmp workspace directory", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, { manifest: { private: true } });
+    writeFileSync(
+      join(workspaceRoot, "release", "allow-list.json"),
+      JSON.stringify({ packages: [], version: 1 }),
+    );
     writeFileSync(
       join(workspaceRoot, "pnpm-workspace.yaml"),
       'packages: ["tmp/*"]\n',

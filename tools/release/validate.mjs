@@ -138,6 +138,48 @@ function findManifests(workspaceRoot) {
     root: dirname(join(workspaceRoot, manifestPath)),
   }));
 }
+function findAllManifests(workspaceRoot) {
+  return allManifestPaths(workspaceRoot)
+    .sort()
+    .map((manifestPath) => ({
+      manifest: readJson(
+        join(workspaceRoot, manifestPath),
+        `package manifest at ${join(workspaceRoot, manifestPath)}`,
+      ),
+      root: dirname(join(workspaceRoot, manifestPath)),
+    }));
+}
+function validateRepositoryManifestPolicy(
+  workspaceManifests,
+  allManifests,
+  allowListNames,
+) {
+  const workspaceRoots = new Set(
+    workspaceManifests.map((candidate) => resolve(candidate.root)),
+  );
+  const byName = new Map();
+  for (const candidate of allManifests) {
+    const { manifest } = candidate;
+    if (typeof manifest.name !== "string")
+      fail("repository package has no name");
+    if (byName.has(manifest.name)) fail("duplicate repository package name");
+    byName.set(manifest.name, candidate);
+    if (
+      !workspaceRoots.has(resolve(candidate.root)) &&
+      manifest.private !== true
+    )
+      fail(`non-workspace package ${manifest.name} must be private`);
+  }
+  for (const candidate of workspaceManifests)
+    if (
+      candidate.manifest.private !== true &&
+      !allowListNames.has(candidate.manifest.name)
+    )
+      fail(
+        `non-private package ${candidate.manifest.name ?? "unknown"} is not allow-listed`,
+      );
+  return byName;
+}
 
 function validateAllowList(allowList) {
   if (
@@ -310,6 +352,23 @@ function validateExports(candidate, packedFiles) {
       );
   }
 }
+function privateSaveptHostname(text) {
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>`]+/gi)) {
+    let hostname;
+    try {
+      hostname = new URL(match[0]).hostname.toLowerCase();
+    } catch {
+      continue;
+    }
+    const labels = hostname.split(".");
+    if (
+      labels.includes("savept") &&
+      (labels.includes("internal") || labels.includes("private"))
+    )
+      return true;
+  }
+  return false;
+}
 function inspectTarball(candidate, tarball, expectedFiles) {
   const extractionRoot = mkdtempSync(join(tmpdir(), "savept-packed-artifact-"));
   try {
@@ -370,13 +429,13 @@ function inspectTarball(candidate, tarball, expectedFiles) {
         fail(
           `private path detected in packed artifact for ${candidate.manifest.name}`,
         );
-      if (
-        /@savept\/(?:product|private)|https?:\/\/[^\s"']*(?:internal|private)[^\s"']*savept/i.test(
-          text,
-        )
-      )
+      if (/@savept\/(?:product|private)/i.test(text))
         fail(
           `private Savept reference detected in packed artifact for ${candidate.manifest.name}`,
+        );
+      if (privateSaveptHostname(text))
+        fail(
+          `private Savept hostname detected in packed artifact for ${candidate.manifest.name}`,
         );
       inspectedFiles.set(filePath, hash(content));
     }
@@ -388,6 +447,69 @@ function inspectTarball(candidate, tarball, expectedFiles) {
     rmSync(extractionRoot, { force: true, recursive: true });
     throw error;
   }
+}
+function nodeRuntimeEntries(exports) {
+  const entries = [];
+  const addConditions = (specifier, value) => {
+    if (typeof value === "string") {
+      entries.push({ mode: "import", specifier });
+      return;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      fail("exports has an unsupported Node runtime shape");
+    const keys = Object.keys(value);
+    if (keys.length === 0) fail("exports has no Node runtime target");
+    for (const key of keys) {
+      if (!["default", "import", "require", "types"].includes(key))
+        fail(
+          `exports condition ${key} is unsupported for Node runtime validation`,
+        );
+      if (typeof value[key] !== "string")
+        fail("exports has an unsupported Node runtime target");
+      if (key === "types") continue;
+      entries.push({
+        mode: key === "require" ? "require" : "import",
+        specifier,
+      });
+    }
+  };
+  if (typeof exports === "string") {
+    addConditions(".", exports);
+  } else if (
+    exports &&
+    typeof exports === "object" &&
+    !Array.isArray(exports)
+  ) {
+    const keys = Object.keys(exports);
+    const subpaths = keys.every((key) => key === "." || key.startsWith("./"));
+    const conditions = keys.every(
+      (key) =>
+        key === "default" ||
+        key === "import" ||
+        key === "require" ||
+        key === "types",
+    );
+    if (!subpaths && !conditions)
+      fail("exports mixes unsupported subpath and condition shapes");
+    if (subpaths) {
+      for (const specifier of keys) {
+        if (specifier.includes("..") || specifier.includes("*"))
+          fail("exports has an unsupported Node runtime subpath");
+        addConditions(specifier, exports[specifier]);
+      }
+    } else {
+      addConditions(".", exports);
+    }
+  } else {
+    fail("exports has an unsupported Node runtime shape");
+  }
+  if (entries.length === 0) fail("exports has no Node runtime target");
+  return entries;
+}
+function installedSpecifier(packageName, exportSpecifier) {
+  return exportSpecifier === "."
+    ? packageName
+    : `${packageName}/${exportSpecifier.slice(2)}`;
 }
 function validateCleanConsumer(candidate, tarball, inspectedFiles) {
   const tempRoot = mkdtempSync(join(tmpdir(), "savept-clean-consumer-"));
@@ -431,23 +553,31 @@ function validateCleanConsumer(candidate, tarball, inspectedFiles) {
           `clean consumer artifact identity mismatch for ${candidate.manifest.name}`,
         );
     }
-    execFileSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "--eval",
-        `await import(${JSON.stringify(candidate.manifest.name)})`,
-      ],
-      {
-        cwd: tempRoot,
-        encoding: "utf8",
-        env: {
-          HOME: join(tempRoot, "home"),
-          PATH: process.env.PATH ?? "",
+    // Node validation executes explicit import/default and require targets only;
+    // types-only and browser-only exports are never treated as Node runtime code.
+    for (const entry of nodeRuntimeEntries(candidate.manifest.exports)) {
+      const specifier = installedSpecifier(
+        candidate.manifest.name,
+        entry.specifier,
+      );
+      const program =
+        entry.mode === "require"
+          ? `import { createRequire } from "node:module"; createRequire(import.meta.url)(${JSON.stringify(specifier)});`
+          : `await import(${JSON.stringify(specifier)});`;
+      execFileSync(
+        process.execPath,
+        ["--input-type=module", "--eval", program],
+        {
+          cwd: tempRoot,
+          encoding: "utf8",
+          env: {
+            HOME: join(tempRoot, "home"),
+            PATH: process.env.PATH ?? "",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
         },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+      );
+    }
   } finally {
     rmSync(tempRoot, { force: true, recursive: true });
   }
@@ -627,22 +757,11 @@ export function validateWorkspace(workspaceRoot) {
   const workflowDiagnostics = validateWorkflowPolicy(workspaceRoot);
   if (workflowDiagnostics.length > 0) fail(workflowDiagnostics[0]);
   const manifests = findManifests(workspaceRoot);
-  const byName = new Map();
-  for (const candidate of manifests) {
-    if (typeof candidate.manifest.name !== "string")
-      fail("workspace package has no name");
-    if (byName.has(candidate.manifest.name))
-      fail("duplicate workspace package name");
-    byName.set(candidate.manifest.name, candidate);
-  }
-  for (const candidate of manifests)
-    if (
-      candidate.manifest.private !== true &&
-      !allowedNames.has(candidate.manifest.name)
-    )
-      fail(
-        `non-private package ${candidate.manifest.name ?? "unknown"} is not allow-listed`,
-      );
+  const byName = validateRepositoryManifestPolicy(
+    manifests,
+    findAllManifests(workspaceRoot),
+    allowedNames,
+  );
   for (const entry of allowList.packages) {
     const candidate = byName.get(entry.name);
     if (!candidate) fail(`allow-listed package ${entry.name} is unknown`);
@@ -682,19 +801,11 @@ export function validateCurrentWorkspace(workspaceRoot) {
   const workflowDiagnostics = validateWorkflowPolicy(workspaceRoot);
   if (workflowDiagnostics.length > 0) fail(workflowDiagnostics[0]);
   const manifests = findManifests(workspaceRoot);
-  const names = new Set();
-  for (const candidate of manifests) {
-    if (
-      typeof candidate.manifest.name !== "string" ||
-      names.has(candidate.manifest.name)
-    )
-      fail("duplicate workspace package name");
-    names.add(candidate.manifest.name);
-    if (candidate.manifest.private !== true && allowList.packages.length === 0)
-      fail(
-        `non-private package ${candidate.manifest.name} is not allow-listed`,
-      );
-  }
+  validateRepositoryManifestPolicy(
+    manifests,
+    findAllManifests(workspaceRoot),
+    new Set(allowList.packages.map((entry) => entry?.name)),
+  );
   if (allowList.packages.length === 0)
     return "RELEASE_CONFIGURATION_SAFELY_BLOCKED: publication allow-list is empty";
   validateWorkspace(workspaceRoot);
