@@ -1,0 +1,11 @@
+{
+  "futurePublishJob": {
+    "allowListGate": true,
+    "environment": "npm-production",
+    "protectedEnvironmentReview": true,
+    "provenanceArgs": ["publish", "--provenance"],
+    "scopedPermissions": ["contents: read", "id-token: write"]
+  },
+  "validationOnly": true,
+  "version": 1
+}
