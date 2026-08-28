@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -48,6 +49,10 @@ function writeReleaseFixture(workspaceRoot, options = {}) {
     license: "MIT",
     name: packageName,
     private: false,
+    publishConfig: {
+      access: "public",
+      registry: "https://registry.npmjs.org/",
+    },
     type: "module",
     version: "1.2.3",
     ...options.manifest,
@@ -340,6 +345,18 @@ describe("release validation", () => {
       "lifecycle script",
     ],
     [
+      "a pack lifecycle script",
+      {
+        manifest: {
+          scripts: {
+            prepack:
+              "node -e \"require('node:fs').writeFileSync('prepack-ran', 'yes')\"",
+          },
+        },
+      },
+      "lifecycle script prepack is forbidden",
+    ],
+    [
       "a workspace dependency",
       { manifest: { dependencies: { shared: "workspace:*" } } },
       "dependency",
@@ -400,6 +417,69 @@ describe("release validation", () => {
     expect(result.status).toBe(1);
     expect(result.output).toContain(`RELEASE_POLICY_BLOCKED: ${diagnostic}`);
     expect(result.output).not.toContain("exampleToken1234567890");
+  });
+
+  it("blocks prepack before it can create a replacement artifact", () => {
+    const workspaceRoot = createWorkspace();
+    const packageRoot = join(workspaceRoot, "packages", "release-fixture");
+    writeReleaseFixture(workspaceRoot, {
+      manifest: {
+        scripts: {
+          prepack:
+            "node -e \"require('node:fs').writeFileSync('prepack-ran', 'yes')\"",
+        },
+      },
+    });
+
+    const result = runValidation(workspaceRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: lifecycle script prepack is forbidden",
+    );
+    expect(existsSync(join(packageRoot, "prepack-ran"))).toBe(false);
+    expect(readdirSync(packageRoot)).not.toContain(
+      "savept-release-fixture-1.2.3.tgz",
+    );
+  });
+
+  it.each([
+    ["a missing publishConfig", { publishConfig: undefined }],
+    [
+      "private access",
+      {
+        publishConfig: {
+          access: "restricted",
+          registry: "https://registry.npmjs.org/",
+        },
+      },
+    ],
+    [
+      "a non-npm registry",
+      {
+        publishConfig: {
+          access: "public",
+          registry: "https://registry.example.test/",
+        },
+      },
+    ],
+    [
+      "a credential-bearing registry",
+      {
+        publishConfig: {
+          access: "public",
+          registry: "https://token@registry.npmjs.org/",
+        },
+      },
+    ],
+  ])("rejects %s", (_description, manifest) => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot, { manifest });
+
+    const result = runValidation(workspaceRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("RELEASE_POLICY_BLOCKED: publishConfig");
   });
 
   it("requires validation CI least privilege and a non-executable provenance publishing contract", () => {
@@ -567,6 +647,94 @@ describe("release validation", () => {
     expect(result.status).toBe(1);
     expect(result.output).toContain(
       "RELEASE_POLICY_BLOCKED: non-private package @savept/unlisted is not allow-listed",
+    );
+  });
+
+  it.each([
+    ["quoted block patterns", 'packages:\n  - "packages/*"\n'],
+    ["flow-style patterns", 'packages: ["packages/*"]\n'],
+  ])("honors pnpm workspace %s", (_description, workspaceYaml) => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot);
+    writeFileSync(join(workspaceRoot, "pnpm-workspace.yaml"), workspaceYaml);
+
+    expect(runValidation(workspaceRoot).status).toBe(0);
+  });
+
+  it("applies negative pnpm workspace patterns before evaluating non-private packages", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot);
+    writeFileSync(
+      join(workspaceRoot, "pnpm-workspace.yaml"),
+      'packages: ["packages/**", "!packages/excluded/**"]\n',
+    );
+    writeWorkspacePackage(workspaceRoot, "packages/excluded/private-looking", {
+      name: "@savept/hidden-public",
+      private: false,
+      version: "1.0.0",
+    });
+
+    expect(runValidation(workspaceRoot).status).toBe(0);
+  });
+
+  it.each([
+    ["an anchor", "packages: &packages\n  - packages/*\n"],
+    ["a tag", "packages: !unsafe [packages/*]\n"],
+    ["a non-string list entry", "packages: [packages/*, 1]\n"],
+    ["an empty pattern list", "packages: []\n"],
+  ])(
+    "fails closed for pnpm workspace YAML with %s",
+    (_description, workspaceYaml) => {
+      const workspaceRoot = createWorkspace();
+      writeReleaseFixture(workspaceRoot);
+      writeFileSync(join(workspaceRoot, "pnpm-workspace.yaml"), workspaceYaml);
+
+      const result = runValidation(workspaceRoot);
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("RELEASE_POLICY_BLOCKED: pnpm workspace");
+    },
+  );
+
+  it("fails closed when workspace patterns hide every manifest while a public manifest exists", () => {
+    const workspaceRoot = createWorkspace();
+    writeReleaseFixture(workspaceRoot);
+    writeFileSync(
+      join(workspaceRoot, "pnpm-workspace.yaml"),
+      "packages: [apps/*]\n",
+    );
+
+    const result = runValidation(workspaceRoot);
+    expect(result.status).toBe(1);
+    expect(result.output).toContain(
+      "RELEASE_POLICY_BLOCKED: pnpm workspace resolves to zero package manifests",
+    );
+  });
+
+  it("rejects a workflow publish command even when --ignore-scripts and --provenance are supplied", () => {
+    const workspaceRoot = createWorkspace();
+    mkdirSync(join(workspaceRoot, ".github", "workflows"), { recursive: true });
+    mkdirSync(join(workspaceRoot, "release"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, ".github", "workflows", "ci.yml"),
+      "on: [push]\npermissions: { contents: read }\njobs:\n  validate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n      - run: npm --ignore-scripts publish --provenance\n",
+    );
+    writeFileSync(
+      join(workspaceRoot, "release", "trusted-publishing-policy.json"),
+      JSON.stringify({
+        futurePublishJob: {
+          allowListGate: true,
+          environment: "npm-production",
+          protectedEnvironmentReview: true,
+          provenanceArgs: ["publish", "--provenance"],
+          scopedPermissions: ["contents: read", "id-token: write"],
+        },
+        validationOnly: true,
+        version: 1,
+      }),
+    );
+
+    expect(validateWorkflowPolicy(workspaceRoot)).toContain(
+      "workflow ci.yml has publication authority",
     );
   });
 

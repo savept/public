@@ -1,22 +1,43 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  globSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { minimatch } from "minimatch";
+import { isAlias, isMap, isSeq, parseDocument } from "yaml";
 
 class PolicyError extends Error {}
+const npmExecutable = join(dirname(process.execPath), "npm");
+const npmRegistry = "https://registry.npmjs.org/";
+const ignoredWorkspaceDirectories = [".git", "dist", "node_modules", "tmp"];
+const forbiddenLifecycleScripts = new Set([
+  "preinstall",
+  "install",
+  "postinstall",
+  "preprepare",
+  "prepare",
+  "postprepare",
+  "prepack",
+  "postpack",
+  "prepublish",
+  "prepublishOnly",
+  "preversion",
+  "version",
+  "postversion",
+]);
 
 function fail(message) {
   throw new PolicyError(`RELEASE_POLICY_BLOCKED: ${message}`);
 }
-
 function readJson(filePath, description) {
   try {
     return JSON.parse(readFileSync(filePath, "utf8"));
@@ -24,70 +45,106 @@ function readJson(filePath, description) {
     fail(`${description} is invalid JSON`);
   }
 }
-
 function packageDirectoryForName(packageName) {
   return packageName.startsWith("@") ? packageName.split("/") : [packageName];
 }
 
+function hasUnsafeYamlNode(node) {
+  if (!node) return false;
+  if (node.anchor || node.tag || isAlias(node)) return true;
+  if (isMap(node))
+    return node.items.some(
+      (pair) => hasUnsafeYamlNode(pair.key) || hasUnsafeYamlNode(pair.value),
+    );
+  return isSeq(node) && node.items.some(hasUnsafeYamlNode);
+}
+function parseYamlObject(source, description) {
+  let document;
+  try {
+    document = parseDocument(source, { prettyErrors: false, uniqueKeys: true });
+  } catch {
+    fail(`${description} is invalid YAML`);
+  }
+  if (
+    document.errors.length > 0 ||
+    document.warnings.length > 0 ||
+    !isMap(document.contents) ||
+    hasUnsafeYamlNode(document.contents)
+  )
+    fail(`${description} is invalid or unsafe YAML`);
+  const value = document.toJS();
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    fail(`${description} has an unsafe YAML shape`);
+  return value;
+}
 function workspacePatterns(workspaceRoot) {
-  const config = readFileSync(
-    join(workspaceRoot, "pnpm-workspace.yaml"),
-    "utf8",
+  const configPath = join(workspaceRoot, "pnpm-workspace.yaml");
+  if (!existsSync(configPath)) fail("pnpm workspace configuration is missing");
+  const config = parseYamlObject(
+    readFileSync(configPath, "utf8"),
+    "pnpm workspace configuration",
   );
-  const packageSection =
-    config.match(/^packages:\n((?:\s+-\s+.+\n?)*)/m)?.[1] ?? "";
-  return [...packageSection.matchAll(/^\s*-\s+(.+)$/gm)].map((match) =>
-    match[1].trim(),
+  if (!Array.isArray(config.packages) || config.packages.length === 0)
+    fail("pnpm workspace packages must be a non-empty pattern list");
+  if (
+    config.packages.some(
+      (pattern) => typeof pattern !== "string" || !pattern.trim(),
+    )
+  )
+    fail("pnpm workspace packages must contain only non-empty strings");
+  return config.packages;
+}
+function allManifestPaths(workspaceRoot) {
+  return globSync("**/package.json", { cwd: workspaceRoot }).filter(
+    (path) =>
+      !path
+        .split("/")
+        .some((part) => ignoredWorkspaceDirectories.includes(part)),
   );
 }
-
-function matchesWorkspacePattern(relativePath, pattern) {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\u0000")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\u0000/g, ".*");
-  return new RegExp(`^${escaped}$`).test(relativePath);
+function matchesWorkspacePatterns(packageDirectory, patterns) {
+  let included = false;
+  for (const pattern of patterns) {
+    const negative = pattern.startsWith("!");
+    const body = negative ? pattern.slice(1) : pattern;
+    if (!body || body.startsWith("/") || body.split("/").includes(".."))
+      fail("pnpm workspace contains an unsafe package pattern");
+    if (minimatch(packageDirectory, body.replace(/\/$/, ""), { dot: true }))
+      included = !negative;
+  }
+  return included;
 }
-
 function findManifests(workspaceRoot) {
   const patterns = workspacePatterns(workspaceRoot);
-  const manifests = [];
-  function visit(directory, relativeDirectory = "") {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if ([".git", "dist", "node_modules", "tmp"].includes(entry.name))
-        continue;
-      const relative = relativeDirectory
-        ? `${relativeDirectory}/${entry.name}`
-        : entry.name;
-      const fullPath = join(directory, entry.name);
-      if (entry.isDirectory()) visit(fullPath, relative);
-      if (entry.isFile() && entry.name === "package.json") {
-        const packagePath = relative.slice(0, -"/package.json".length);
-        if (
-          patterns.some((pattern) =>
-            matchesWorkspacePattern(packagePath, pattern),
-          )
-        ) {
-          manifests.push({
-            manifest: readJson(fullPath, `package manifest at ${fullPath}`),
-            root: directory,
-          });
-        }
-      }
-    }
+  const manifestPaths = allManifestPaths(workspaceRoot).filter((path) =>
+    matchesWorkspacePatterns(dirname(path), patterns),
+  );
+  if (manifestPaths.length === 0) {
+    const hiddenNonPrivate = allManifestPaths(workspaceRoot).find(
+      (path) =>
+        readJson(join(workspaceRoot, path), "workspace package manifest")
+          .private === false,
+    );
+    if (hiddenNonPrivate)
+      fail(
+        "pnpm workspace resolves to zero package manifests while a non-private package exists",
+      );
   }
-  visit(workspaceRoot);
-  return manifests;
+  return manifestPaths.sort().map((manifestPath) => ({
+    manifest: readJson(
+      join(workspaceRoot, manifestPath),
+      `package manifest at ${join(workspaceRoot, manifestPath)}`,
+    ),
+    root: dirname(join(workspaceRoot, manifestPath)),
+  }));
 }
 
 function validateAllowList(allowList) {
   if (
     allowList.version !== 1 ||
     Object.keys(allowList).some((key) => !["packages", "version"].includes(key))
-  ) {
+  )
     fail("publication allow-list schema is invalid");
-  }
   if (!Array.isArray(allowList.packages))
     fail("publication allow-list has no packages array");
   if (allowList.packages.length === 0) fail("publication allow-list is empty");
@@ -100,15 +157,13 @@ function validateAllowList(allowList) {
       Object.keys(entry).some(
         (key) => !["expectedFiles", "license", "name"].includes(key),
       )
-    ) {
+    )
       fail("publication allow-list has an invalid package entry");
-    }
     if (names.has(entry.name)) fail("duplicate allow-list package");
     names.add(entry.name);
   }
   return names;
 }
-
 const approvedSpdx = new Set([
   "Apache-2.0",
   "BSD-2-Clause",
@@ -117,7 +172,19 @@ const approvedSpdx = new Set([
   "MIT",
   "MPL-2.0",
 ]);
-
+function validatePublishConfig(manifest) {
+  const config = manifest.publishConfig;
+  if (
+    !config ||
+    typeof config !== "object" ||
+    Array.isArray(config) ||
+    Object.keys(config).some((key) => !["access", "registry"].includes(key)) ||
+    config.access !== "public" ||
+    config.registry !== npmRegistry ||
+    /@|\?.*|#/.test(config.registry)
+  )
+    fail(`publishConfig is invalid for ${manifest.name ?? "unknown"}`);
+}
 function validateManifest(
   candidate,
   candidatesByName,
@@ -129,87 +196,87 @@ function validateManifest(
     fail(`candidate ${manifest.name ?? "unknown"} must set private to false`);
   if (typeof manifest.name !== "string" || !manifest.name.startsWith("@"))
     fail("candidate name is invalid");
+  validatePublishConfig(manifest);
   if (
     typeof manifest.version !== "string" ||
     !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version)
-  ) {
+  )
     fail(`candidate ${manifest.name} has an invalid version`);
-  }
   if (
     !manifest.exports ||
     !Array.isArray(manifest.files) ||
     manifest.files.length === 0
-  ) {
+  )
     fail(`candidate ${manifest.name} requires exports and files`);
-  }
   if (
     typeof manifest.license !== "string" ||
     !approvedSpdx.has(manifest.license) ||
     manifest.license !== allowListEntry.license
-  ) {
+  )
     fail(`license metadata is invalid for ${manifest.name}`);
-  }
   if (!existsSync(join(candidate.root, "LICENSE")))
-    fail(`license file is missing for ${candidate.manifest.name}`);
-  for (const scriptName of [
-    "preinstall",
-    "install",
-    "postinstall",
-    "prepare",
-  ]) {
+    fail(`license file is missing for ${manifest.name}`);
+  for (const scriptName of forbiddenLifecycleScripts)
     if (manifest.scripts?.[scriptName])
       fail(`lifecycle script ${scriptName} is forbidden`);
-  }
   for (const section of [
     "dependencies",
     "devDependencies",
     "optionalDependencies",
     "peerDependencies",
-  ]) {
+  ])
     for (const [name, version] of Object.entries(manifest[section] ?? {})) {
       if (
         typeof version !== "string" ||
         /^(workspace:|file:|git\+|git:|github:|ssh:|https?:.*\.git(?:#.*)?$)/.test(
           version,
         )
-      ) {
+      )
         fail(`dependency ${name} in ${section} is inappropriate`);
-      }
       if (name.startsWith("@savept/")) {
         const dependency = candidatesByName.get(name);
         if (
           !dependency ||
           dependency.manifest.private !== false ||
           !allowListNames.has(name)
-        ) {
+        )
           fail(
             `dependency ${name} in ${section} is not an approved public package`,
           );
-        }
       }
     }
-  }
 }
 
+function npmEnvironment() {
+  const safeEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !/^(?:npm_|NPM_|NODE_AUTH_TOKEN$)/.test(name),
+    ),
+  );
+  return {
+    ...safeEnvironment,
+    HOME: join(tmpdir(), "savept-npm-home"),
+    npm_config_cache: join(tmpdir(), "savept-npm-cache"),
+    npm_config_globalconfig: join(tmpdir(), "savept-empty-global.npmrc"),
+    npm_config_registry: npmRegistry,
+    npm_config_userconfig: join(tmpdir(), "savept-empty-user.npmrc"),
+  };
+}
 function runNpm(args, cwd) {
-  return execFileSync(join(dirname(process.execPath), "npm"), args, {
+  return execFileSync(npmExecutable, args, {
     cwd,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      npm_config_cache: join(tmpdir(), "savept-npm-cache"),
-    },
+    env: npmEnvironment(),
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
-
 function parsePackResult(output) {
   try {
     const result = JSON.parse(output);
     if (
       !Array.isArray(result) ||
       result.length !== 1 ||
-      !Array.isArray(result[0].files)
+      typeof result[0].filename !== "string"
     )
       fail("npm pack produced invalid metadata");
     return result[0];
@@ -218,13 +285,14 @@ function parsePackResult(output) {
     fail("npm pack did not return JSON metadata");
   }
 }
-
+function hash(contents) {
+  return createHash("sha256").update(contents).digest("hex");
+}
 function exportTargets(value) {
   if (typeof value === "string") return [value];
   if (!value || typeof value !== "object") return [];
   return Object.values(value).flatMap(exportTargets);
 }
-
 function validateExports(candidate, packedFiles) {
   const targets = exportTargets(candidate.manifest.exports);
   if (targets.length === 0)
@@ -236,68 +304,94 @@ function validateExports(candidate, packedFiles) {
       target.includes("..") ||
       !packedPath.startsWith("dist/") ||
       !packedFiles.includes(packedPath)
-    ) {
+    )
       fail(
         `export target is unsafe or unpacked for ${candidate.manifest.name}`,
       );
-    }
   }
 }
-
-function validatePackedFiles(candidate, expectedFiles) {
-  const packed = parsePackResult(
-    runNpm(["pack", "--dry-run", "--json"], candidate.root),
-  );
-  const actualFiles = packed.files.map((file) => file.path).sort();
-  const expected = [...expectedFiles].sort();
-  if (JSON.stringify(actualFiles) !== JSON.stringify(expected))
-    fail(`unexpected packed file for ${candidate.manifest.name}`);
-  validateExports(candidate, actualFiles);
-  for (const filePath of actualFiles) {
-    if (
-      /(^|\/)(?:\.env(?:\.|$)|\.git(?:\/|$)|\.github(?:\/|$)|node_modules(?:\/|$)|src(?:\/|$)|source(?:\/|$)|[^/]+\.(?:tgz|tsx|mts|cts|map)$|[^/]+(?<!\.d)\.ts$|(?:npmrc|yarnrc|pnpmfile\.cjs)$)/i.test(
-        filePath,
-      )
-    ) {
-      fail(`forbidden packed path for ${candidate.manifest.name}`);
-    }
-    const content = readFileSync(join(candidate.root, filePath), "utf8");
-    if (
-      /(?:gh[pousr]_[A-Za-z0-9_-]{12,}|npm_[A-Za-z0-9_-]{12,}|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i.test(
-        content,
-      )
-    ) {
-      fail(
-        `sensitive data detected in packed artifact for ${candidate.manifest.name}`,
-      );
-    }
-    if (
-      /(?:\/savept\/(?:product|private)|\\savept\\(?:product|private)|\/Users\/[^/]+\/projects\/savept)/i.test(
-        content,
-      )
-    ) {
-      fail(
-        `private path detected in packed artifact for ${candidate.manifest.name}`,
-      );
-    }
-    if (
-      /@savept\/(?:product|private)|https?:\/\/[^\s"']*(?:internal|private)[^\s"']*savept/i.test(
-        content,
-      )
-    ) {
-      fail(
-        `private Savept reference detected in packed artifact for ${candidate.manifest.name}`,
-      );
-    }
-  }
-}
-
-function validateCleanConsumer(candidate) {
-  const tempRoot = mkdtempSync(join(tmpdir(), "savept-clean-consumer-"));
-  let tarball;
+function inspectTarball(candidate, tarball, expectedFiles) {
+  const extractionRoot = mkdtempSync(join(tmpdir(), "savept-packed-artifact-"));
   try {
-    const pack = parsePackResult(runNpm(["pack", "--json"], candidate.root));
-    tarball = join(candidate.root, pack.filename);
+    const files = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
+      .split("\n")
+      .filter(Boolean)
+      .filter((entry) => !entry.endsWith("/"))
+      .map((entry) => {
+        if (
+          !entry.startsWith("package/") ||
+          entry.includes("../") ||
+          entry.startsWith("/")
+        )
+          fail(
+            `packed artifact has an unsafe path for ${candidate.manifest.name}`,
+          );
+        return entry.slice("package/".length);
+      })
+      .sort();
+    if (JSON.stringify(files) !== JSON.stringify([...expectedFiles].sort()))
+      fail(`unexpected packed file for ${candidate.manifest.name}`);
+    execFileSync("tar", ["-xzf", tarball, "-C", extractionRoot], {
+      encoding: "utf8",
+    });
+    const packageRoot = join(extractionRoot, "package");
+    validateExports(candidate, files);
+    const inspectedFiles = new Map();
+    for (const filePath of files) {
+      const fullPath = resolve(packageRoot, filePath);
+      if (
+        !fullPath.startsWith(`${packageRoot}${sep}`) ||
+        !statSync(fullPath).isFile()
+      )
+        fail(
+          `packed artifact has an unsafe file for ${candidate.manifest.name}`,
+        );
+      if (
+        /(^|\/)(?:\.env(?:\.|$)|\.git(?:\/|$)|\.github(?:\/|$)|node_modules(?:\/|$)|src(?:\/|$)|source(?:\/|$)|[^/]+\.(?:tgz|tsx|mts|cts|map)$|[^/]+(?<!\.d)\.ts$|(?:npmrc|yarnrc|pnpmfile\.cjs)$)/i.test(
+          filePath,
+        )
+      )
+        fail(`forbidden packed path for ${candidate.manifest.name}`);
+      const content = readFileSync(fullPath);
+      const text = content.toString("utf8");
+      if (
+        /(?:gh[pousr]_[A-Za-z0-9_-]{12,}|npm_[A-Za-z0-9_-]{12,}|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i.test(
+          text,
+        )
+      )
+        fail(
+          `sensitive data detected in packed artifact for ${candidate.manifest.name}`,
+        );
+      if (
+        /(?:\/savept\/(?:product|private)|\\savept\\(?:product|private)|\/Users\/[^/]+\/projects\/savept)/i.test(
+          text,
+        )
+      )
+        fail(
+          `private path detected in packed artifact for ${candidate.manifest.name}`,
+        );
+      if (
+        /@savept\/(?:product|private)|https?:\/\/[^\s"']*(?:internal|private)[^\s"']*savept/i.test(
+          text,
+        )
+      )
+        fail(
+          `private Savept reference detected in packed artifact for ${candidate.manifest.name}`,
+        );
+      inspectedFiles.set(filePath, hash(content));
+    }
+    return {
+      cleanup: () => rmSync(extractionRoot, { force: true, recursive: true }),
+      files: inspectedFiles,
+    };
+  } catch (error) {
+    rmSync(extractionRoot, { force: true, recursive: true });
+    throw error;
+  }
+}
+function validateCleanConsumer(candidate, tarball, inspectedFiles) {
+  const tempRoot = mkdtempSync(join(tmpdir(), "savept-clean-consumer-"));
+  try {
     writeFileSync(
       join(tempRoot, "package.json"),
       JSON.stringify({ private: true, type: "module" }),
@@ -308,7 +402,8 @@ function validateCleanConsumer(candidate) {
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
-        "--offline",
+        "--registry",
+        npmRegistry,
         tarball,
       ],
       tempRoot,
@@ -321,10 +416,20 @@ function validateCleanConsumer(candidate) {
     if (
       !existsSync(join(installed, "package.json")) ||
       realpathSync(installed).startsWith(resolve(candidate.root))
-    ) {
+    )
       fail(
         `clean consumer install did not use a tarball for ${candidate.manifest.name}`,
       );
+    for (const [filePath, expectedHash] of inspectedFiles) {
+      const installedPath = resolve(installed, filePath);
+      if (
+        !installedPath.startsWith(`${installed}${sep}`) ||
+        !existsSync(installedPath) ||
+        hash(readFileSync(installedPath)) !== expectedHash
+      )
+        fail(
+          `clean consumer artifact identity mismatch for ${candidate.manifest.name}`,
+        );
     }
     execFileSync(
       process.execPath,
@@ -333,56 +438,150 @@ function validateCleanConsumer(candidate) {
         "--eval",
         `await import(${JSON.stringify(candidate.manifest.name)})`,
       ],
-      {
-        cwd: tempRoot,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
+      { cwd: tempRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
   } finally {
-    if (tarball) rmSync(tarball, { force: true });
     rmSync(tempRoot, { force: true, recursive: true });
   }
 }
 
+function validateWorkflowDocument(name, source) {
+  let workflow;
+  try {
+    workflow = parseYamlObject(source, `workflow ${name}`);
+  } catch (error) {
+    return [
+      error instanceof PolicyError
+        ? error.message.replace("RELEASE_POLICY_BLOCKED: ", "")
+        : `workflow ${name} is invalid`,
+    ];
+  }
+  if (
+    Object.keys(workflow).some(
+      (key) =>
+        !["concurrency", "jobs", "name", "on", "permissions"].includes(key),
+    )
+  )
+    return [`workflow ${name} has unsupported configuration`];
+  const triggers = workflow.on;
+  const triggerNames = Array.isArray(triggers)
+    ? triggers
+    : triggers && typeof triggers === "object"
+      ? Object.keys(triggers)
+      : typeof triggers === "string"
+        ? [triggers]
+        : [];
+  if (
+    triggerNames.some((trigger) => !["push", "pull_request"].includes(trigger))
+  )
+    return [`workflow ${name} has publication authority`];
+  if (
+    workflow.permissions !== undefined &&
+    (Object.keys(workflow.permissions ?? {}).length !== 1 ||
+      workflow.permissions?.contents !== "read")
+  )
+    return ["ordinary CI must use contents: read only"];
+  if (containsPublishRun(workflow))
+    return [`workflow ${name} has publication authority`];
+  if (
+    workflow.concurrency !== undefined &&
+    (!workflow.concurrency ||
+      typeof workflow.concurrency !== "object" ||
+      Array.isArray(workflow.concurrency) ||
+      Object.keys(workflow.concurrency).some(
+        (key) => !["group", "cancel-in-progress"].includes(key),
+      ) ||
+      typeof workflow.concurrency.group !== "string" ||
+      typeof workflow.concurrency["cancel-in-progress"] !== "boolean")
+  )
+    return [`workflow ${name} has unsupported configuration`];
+  if (workflow.jobs === undefined) return [];
+  if (
+    !workflow.jobs ||
+    typeof workflow.jobs !== "object" ||
+    Array.isArray(workflow.jobs) ||
+    Object.keys(workflow.jobs).some((jobName) => jobName !== "validate")
+  )
+    return [`workflow ${name} has unsupported configuration`];
+  const job = workflow.jobs.validate;
+  if (
+    !job ||
+    typeof job !== "object" ||
+    Array.isArray(job) ||
+    Object.keys(job).some(
+      (key) => !["runs-on", "steps", "timeout-minutes"].includes(key),
+    ) ||
+    job["runs-on"] !== "ubuntu-latest" ||
+    !Number.isInteger(job["timeout-minutes"]) ||
+    job["timeout-minutes"] > 15 ||
+    job["timeout-minutes"] < 1 ||
+    !Array.isArray(job.steps)
+  )
+    return [`workflow ${name} has unsupported configuration`];
+  const allowedUses = new Set([
+    "actions/checkout@v7",
+    "asdf-vm/actions/install@v4.0.1",
+  ]);
+  const allowedRuns = new Set([
+    "pnpm install --frozen-lockfile",
+    "pnpm format:check",
+    "pnpm check",
+    "pnpm release:validate",
+    "pnpm release:current",
+  ]);
+  for (const step of job.steps) {
+    if (
+      !step ||
+      typeof step !== "object" ||
+      Array.isArray(step) ||
+      Object.keys(step).some((key) => !["name", "run", "uses"].includes(key)) ||
+      (typeof step.name !== "undefined" && typeof step.name !== "string") ||
+      (typeof step.uses === "string" && typeof step.run === "string") ||
+      (typeof step.uses !== "string" && typeof step.run !== "string")
+    )
+      return [`workflow ${name} has unsupported configuration`];
+    if (typeof step.uses === "string" && !allowedUses.has(step.uses))
+      return [`workflow ${name} has unsupported configuration`];
+    if (typeof step.run === "string" && !allowedRuns.has(step.run))
+      return [
+        /\bnpm(?:\s+--[^\s]+)*\s+publish\b/i.test(step.run)
+          ? `workflow ${name} has publication authority`
+          : `workflow ${name} has unsupported configuration`,
+      ];
+  }
+  return [];
+}
+function containsPublishRun(value) {
+  if (typeof value === "string")
+    return /\bnpm(?:\s+--[^\s]+)*\s+publish\b/i.test(value);
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some(containsPublishRun);
+}
 export function validateWorkflowPolicy(workspaceRoot) {
-  const diagnostics = [];
-  const ciPath = join(workspaceRoot, ".github", "workflows", "ci.yml");
   const policyPath = join(
     workspaceRoot,
     "release",
     "trusted-publishing-policy.json",
   );
-  const ci = existsSync(ciPath) ? readFileSync(ciPath, "utf8") : "";
-  const policySource = existsSync(policyPath)
-    ? readFileSync(policyPath, "utf8")
-    : "";
   let policy;
   try {
-    policy = JSON.parse(policySource);
+    policy = JSON.parse(
+      existsSync(policyPath) ? readFileSync(policyPath, "utf8") : "",
+    );
   } catch {
     return ["trusted publishing policy is invalid JSON"];
   }
-  if (
-    !/^permissions:\n  contents: read\s*$/m.test(ci) ||
-    /id-token:|packages:|actions:|write/.test(ci)
-  ) {
-    diagnostics.push("ordinary CI must use contents: read only");
-  }
   const workflowsRoot = join(workspaceRoot, ".github", "workflows");
-  for (const entry of existsSync(workflowsRoot)
-    ? readdirSync(workflowsRoot, { withFileTypes: true })
-    : []) {
-    if (!entry.isFile() || !/\.ya?ml$/.test(entry.name)) continue;
-    const source = readFileSync(join(workflowsRoot, entry.name), "utf8");
-    if (
-      /npm\s+publish|id-token:|NPM_TOKEN|NODE_AUTH_TOKEN|secrets\.|workflow_dispatch|(?:^|\n)\s*release:|packages:\s*write|contents:\s*write/i.test(
-        source,
-      )
-    ) {
-      diagnostics.push(`workflow ${entry.name} has publication authority`);
-    }
-  }
+  const diagnostics = [];
+  for (const workflow of existsSync(workflowsRoot)
+    ? globSync("*.y*ml", { cwd: workflowsRoot })
+    : [])
+    diagnostics.push(
+      ...validateWorkflowDocument(
+        workflow,
+        readFileSync(join(workflowsRoot, workflow), "utf8"),
+      ),
+    );
   const job = policy.futurePublishJob;
   if (
     policy.version !== 1 ||
@@ -398,19 +597,20 @@ export function validateWorkflowPolicy(workspaceRoot) {
       JSON.stringify(["contents: read", "id-token: write"]) ||
     JSON.stringify(job.provenanceArgs) !==
       JSON.stringify(["publish", "--provenance"])
-  ) {
+  )
     diagnostics.push(
       "future publish policy must require allow-list, reviewed environment, job-scoped OIDC, and provenance",
     );
-  }
-  if (/npm\s+publish|NPM_TOKEN|NODE_AUTH_TOKEN|secrets\./i.test(policySource)) {
+  if (
+    /npm\s+publish|NPM_TOKEN|NODE_AUTH_TOKEN|secrets\./i.test(
+      JSON.stringify(policy),
+    )
+  )
     diagnostics.push(
       "trusted publishing policy must not contain an executable publish command or token",
     );
-  }
   return diagnostics;
 }
-
 export function validateWorkspace(workspaceRoot) {
   const allowListPath = join(workspaceRoot, "release", "allow-list.json");
   if (!existsSync(allowListPath)) fail("publication allow-list is missing");
@@ -427,28 +627,40 @@ export function validateWorkspace(workspaceRoot) {
       fail("duplicate workspace package name");
     byName.set(candidate.manifest.name, candidate);
   }
-  for (const candidate of manifests) {
+  for (const candidate of manifests)
     if (
       candidate.manifest.private !== true &&
       !allowedNames.has(candidate.manifest.name)
-    ) {
+    )
       fail(
         `non-private package ${candidate.manifest.name ?? "unknown"} is not allow-listed`,
       );
-    }
-  }
   for (const entry of allowList.packages) {
     const candidate = byName.get(entry.name);
     if (!candidate) fail(`allow-listed package ${entry.name} is unknown`);
     validateManifest(candidate, byName, allowedNames, entry);
-    validatePackedFiles(candidate, entry.expectedFiles);
-    validateCleanConsumer(candidate);
-    console.log(
-      `RELEASE_VALIDATED: ${candidate.manifest.name}@${candidate.manifest.version} packed and installed cleanly`,
-    );
+    let tarball;
+    let inspection;
+    try {
+      const pack = parsePackResult(
+        runNpm(["pack", "--ignore-scripts", "--json"], candidate.root),
+      );
+      tarball = join(candidate.root, pack.filename);
+      if (!existsSync(tarball))
+        fail(
+          `npm pack did not create a tarball for ${candidate.manifest.name}`,
+        );
+      inspection = inspectTarball(candidate, tarball, entry.expectedFiles);
+      validateCleanConsumer(candidate, tarball, inspection.files);
+      console.log(
+        `RELEASE_VALIDATED: ${candidate.manifest.name}@${candidate.manifest.version} packed and installed cleanly`,
+      );
+    } finally {
+      inspection?.cleanup();
+      if (tarball) rmSync(tarball, { force: true });
+    }
   }
 }
-
 export function validateCurrentWorkspace(workspaceRoot) {
   const allowListPath = join(workspaceRoot, "release", "allow-list.json");
   if (!existsSync(allowListPath)) fail("publication allow-list is missing");
@@ -457,9 +669,8 @@ export function validateCurrentWorkspace(workspaceRoot) {
     !Array.isArray(allowList.packages) ||
     allowList.version !== 1 ||
     Object.keys(allowList).some((key) => !["packages", "version"].includes(key))
-  ) {
+  )
     fail("publication allow-list schema is invalid");
-  }
   const workflowDiagnostics = validateWorkflowPolicy(workspaceRoot);
   if (workflowDiagnostics.length > 0) fail(workflowDiagnostics[0]);
   const manifests = findManifests(workspaceRoot);
@@ -481,7 +692,6 @@ export function validateCurrentWorkspace(workspaceRoot) {
   validateWorkspace(workspaceRoot);
   return "RELEASE_CONFIGURATION_VALIDATED";
 }
-
 if (import.meta.url === `file://${process.argv[1]}`) {
   const rootArgumentIndex = process.argv.indexOf("--root");
   const workspaceRoot =

@@ -22,6 +22,9 @@ importers:
       eslint:
         specifier: 10.9.1
         version: 10.9.1(supports-color@7.2.0)
+      minimatch:
+        specifier: 10.2.5
+        version: 10.2.5
       nx:
         specifier: 23.1.2
         version: 23.1.2
@@ -37,6 +40,9 @@ importers:
       vitest:
         specifier: 4.1.11
         version: 4.1.11(@types/node@26.4.0)(yaml@2.9.0)
+      yaml:
+        specifier: 2.9.0
+        version: 2.9.0
 
   packages/workspace-spike: {}
 
