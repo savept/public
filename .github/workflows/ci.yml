@@ -26,6 +26,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Enforce workspace and dependency policy
+        run: pnpm policy:check
+
       - name: Check formatting
         run: pnpm format:check
 
