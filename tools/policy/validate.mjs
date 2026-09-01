@@ -453,21 +453,34 @@ function validateSpecifier({
   specifier,
   sourcePath,
   owner,
+  packages,
+  importedWorkspaceDependencies,
   manifestsByName,
   repositoryRoot,
 }) {
+  if (path.isAbsolute(specifier) || path.win32.isAbsolute(specifier)) {
+    block(
+      `absolute source import is not allowed in ${sourcePath}: ${specifier}`,
+    );
+  }
   if (/^[a-z][a-z\d+.-]*:/i.test(specifier)) {
     if (specifier.startsWith("node:")) return;
     block(`import protocol is not allowed in ${sourcePath}: ${specifier}`);
   }
-  if (specifier.startsWith(".") || path.isAbsolute(specifier)) {
+  if (specifier.startsWith(".")) {
+    const normalized = specifier.replaceAll("\\", "/");
     const resolved = path.resolve(
       path.dirname(path.join(repositoryRoot, sourcePath)),
-      specifier,
+      normalized,
     );
     if (!isWithin(repositoryRoot, resolved))
       block(
         `relative import escapes repository in ${sourcePath}: ${specifier}`,
+      );
+    const target = owningPackage(packages, resolved);
+    if (target && target.path !== owner.path)
+      block(
+        `relative import bypasses package boundary in ${sourcePath}: ${specifier}`,
       );
     return;
   }
@@ -486,6 +499,8 @@ function validateSpecifier({
   const entry = selectExportEntry(target.manifest.exports, subpath);
   if (!exportEntryAllows(entry))
     block(`package subpath is not exported by ${target.name}: ${subpath}`);
+  if (owner.path !== target.path)
+    recordWorkspaceEdge(importedWorkspaceDependencies, owner, target);
 }
 
 const MAX_STATIC_STRING_ANALYSIS_NODES = 1_024;
@@ -674,12 +689,23 @@ function owningPackage(packages, candidate) {
   return packages.find((entry) => isWithin(entry.path, candidate));
 }
 
+function recordWorkspaceEdge(edges, owner, target) {
+  if (!edges || !owner || !target || owner.path === target.path) return;
+  let targets = edges.get(owner.path);
+  if (!targets) {
+    targets = new Set();
+    edges.set(owner.path, targets);
+  }
+  targets.add(target.path);
+}
+
 function validateTsconfig({
   repositoryRoot,
   configPath,
   content,
   packages,
   manifestsByName,
+  projectReferences,
 }) {
   const parsed = ts.parseConfigFileTextToJson(configPath, content);
   if (parsed.error) {
@@ -706,11 +732,16 @@ function validateTsconfig({
     if (!Array.isArray(config.references))
       block(`tsconfig references in ${configPath} must be an array`);
     for (const reference of config.references) {
-      resolveConfigPath(
+      const resolved = resolveConfigPath(
         repositoryRoot,
         configPath,
         reference?.path,
         "reference path",
+      );
+      recordWorkspaceEdge(
+        projectReferences,
+        configOwner,
+        owningPackage(packages, resolved),
       );
     }
   }
@@ -801,6 +832,24 @@ export function validatePolicy({
 
   const manifestsByName = new Map();
   const manifestsByPath = [];
+  const importedWorkspaceDependencies = new Map();
+  const projectReferences = new Map();
+  const discoveredManifestPaths = new Set(
+    records.map((record) => {
+      const relativeDirectory = path.relative(repositoryRoot, record.path);
+      return relativeDirectory
+        ? path.join(relativeDirectory, "package.json")
+        : "package.json";
+    }),
+  );
+  for (const filePath of inventory.keys()) {
+    if (
+      path.basename(filePath) === "package.json" &&
+      !discoveredManifestPaths.has(filePath)
+    ) {
+      block(`package.json is missing from workspace discovery: ${filePath}`);
+    }
+  }
   for (const record of records) {
     const relativeDirectory = path.relative(repositoryRoot, record.path);
     const manifestPath = relativeDirectory
@@ -841,6 +890,7 @@ export function validatePolicy({
         content,
         packages: manifestsByPath,
         manifestsByName,
+        projectReferences,
       });
     }
     if (!SOURCE_EXTENSIONS.some((extension) => filePath.endsWith(extension)))
@@ -855,9 +905,25 @@ export function validatePolicy({
         specifier,
         sourcePath: filePath,
         owner,
+        packages: manifestsByPath,
+        importedWorkspaceDependencies,
         manifestsByName,
         repositoryRoot,
       });
+    }
+  }
+  for (const [ownerPath, targets] of importedWorkspaceDependencies) {
+    const references = projectReferences.get(ownerPath);
+    for (const targetPath of targets) {
+      if (!references?.has(targetPath)) {
+        const owner = manifestsByPath.find((entry) => entry.path === ownerPath);
+        const target = manifestsByPath.find(
+          (entry) => entry.path === targetPath,
+        );
+        block(
+          `statically imported local dependency requires a matching TypeScript project reference: ${owner.name} -> ${target.name}`,
+        );
+      }
     }
   }
 }

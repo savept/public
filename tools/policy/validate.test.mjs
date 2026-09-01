@@ -50,6 +50,13 @@ function packageManifest(name, extra = {}) {
   });
 }
 
+function referencePackageB() {
+  return {
+    path: "packages/a/tsconfig.json",
+    content: '{ "references": [{ "path": "../b" }] }',
+  };
+}
+
 function baseFixture({
   extraFiles = [],
   records,
@@ -379,6 +386,21 @@ test("validatePolicy blocks malformed workspace configuration discovery", () => 
   );
 });
 
+test("validatePolicy requires the root package manifest in workspace discovery", () => {
+  assertBlocked(
+    () =>
+      validatePolicy(
+        baseFixture({
+          records: [
+            { name: "@savept/a", path: `${ROOT}/packages/a` },
+            { name: "@savept/b", path: `${ROOT}/packages/b` },
+          ],
+        }),
+      ),
+    /package\.json.*workspace discovery/i,
+  );
+});
+
 for (const extension of [
   "ts",
   "tsx",
@@ -584,6 +606,7 @@ test("validatePolicy accepts declared static require.resolve exports", () => {
             content:
               'require.resolve("@savept/b/feature"); require(require.resolve("@savept/b/feature"));',
           },
+          referencePackageB(),
         ],
       }),
     ),
@@ -839,6 +862,7 @@ test("validatePolicy blocks tsconfig aliases targeting a package root wildcard",
       validatePolicy(
         baseFixture({
           records: [
+            { name: "@savept/public-workspace", path: ROOT },
             { name: "@savept/a", path: `${ROOT}/packages/a` },
             { name: "@savept/b", path: `${ROOT}/packages/b` },
           ],
@@ -991,6 +1015,58 @@ test("validatePolicy blocks escaped relative source paths and protocols", () => 
   }
 });
 
+test("validatePolicy blocks relative imports into another workspace package", () => {
+  assertBlocked(
+    () =>
+      validatePolicy(
+        baseFixture({
+          extraFiles: [
+            {
+              path: "packages/a/src/index.ts",
+              content: 'import "../../b/src/internal.ts";',
+            },
+          ],
+        }),
+      ),
+    /relative import.*package/i,
+  );
+  assert.doesNotThrow(() =>
+    validatePolicy(
+      baseFixture({
+        extraFiles: [
+          {
+            path: "packages/a/src/index.ts",
+            content: 'import "./internal.ts";',
+          },
+        ],
+      }),
+    ),
+  );
+});
+
+test("validatePolicy rejects Windows source paths before platform traversal", () => {
+  for (const specifier of [
+    "..\\\\..\\\\..\\\\..\\\\private\\\\index.js",
+    "C:\\private\\\\index.js",
+    "\\\\\\\\server\\\\share\\\\index.js",
+  ]) {
+    assertBlocked(
+      () =>
+        validatePolicy(
+          baseFixture({
+            extraFiles: [
+              {
+                path: "packages/a/src/index.ts",
+                content: `import ${JSON.stringify(specifier)};`,
+              },
+            ],
+          }),
+        ),
+      /relative import escapes|absolute source import/i,
+    );
+  }
+});
+
 test("validatePolicy rejects unknown public-scope dependencies and imports", () => {
   assertBlocked(
     () =>
@@ -1028,6 +1104,35 @@ test("validatePolicy accepts declared workspace imports through exports", () => 
             path: "packages/a/src/index.ts",
             content:
               'import root from "@savept/b"; export { feature } from "@savept/b/feature";',
+          },
+          referencePackageB(),
+        ],
+      }),
+    ),
+  );
+});
+
+test("validatePolicy requires project references for imported workspace dependencies", () => {
+  const packageA = { dependencies: { "@savept/b": "workspace:*" } };
+  const importedSource = {
+    path: "packages/a/src/index.ts",
+    content: 'import "@savept/b";',
+  };
+  assertBlocked(
+    () =>
+      validatePolicy(baseFixture({ packageA, extraFiles: [importedSource] })),
+    /project reference/i,
+  );
+  assert.doesNotThrow(() => validatePolicy(baseFixture({ packageA })));
+  assert.doesNotThrow(() =>
+    validatePolicy(
+      baseFixture({
+        packageA,
+        extraFiles: [
+          importedSource,
+          {
+            path: "packages/a/tsconfig.json",
+            content: '{ "references": [{ "path": "../b" }] }',
           },
         ],
       }),
@@ -1237,6 +1342,7 @@ test("validatePolicy supports exact, wildcard, conditional, array, and nested ex
             content:
               'import "@savept/b/exact"; import "@savept/b/features/one";',
           },
+          referencePackageB(),
         ],
       }),
     ),
@@ -1304,6 +1410,7 @@ test("validatePolicy accepts a broad wildcard export when not excluded", () => {
             path: "packages/a/src/index.ts",
             content: 'import "@savept/b/feature/public";',
           },
+          referencePackageB(),
         ],
       }),
     ),
