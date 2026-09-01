@@ -29,6 +29,9 @@ jobs:
       - name: Enforce workspace and dependency policy
         run: pnpm policy:check
 
+      - name: Test workspace and dependency policy
+        run: pnpm test:policy
+
       - name: Check formatting
         run: pnpm format:check
 

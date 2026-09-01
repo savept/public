@@ -543,7 +543,8 @@ describe("release validation", () => {
 
     const workflow = (permissions, steps) =>
       `on: [push]\npermissions:\n${permissions}\njobs:\n  validate:\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps:\n${steps}`;
-    const policyStep = "      - run: pnpm policy:check\n";
+    const policyStep =
+      "      - run: pnpm policy:check\n      - run: pnpm test:policy\n";
 
     writeFileSync(
       join(workflowsRoot, "ci.yml"),

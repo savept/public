@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -14,6 +15,7 @@ import { join } from "node:path";
 
 import {
   checkToolchain,
+  collectFiles,
   parseToolVersions,
   parseWorkspaceDiscovery,
   runCli,
@@ -1369,6 +1371,155 @@ test("runCli blocks contained symlink directory cycles promptly", () => {
   } finally {
     rmSync(root, { force: true, recursive: true });
   }
+});
+
+test("collectFiles blocks dangling symlinks beneath excluded build trees with a stable policy error", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-dangling-excluded-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    mkdirSync(join(root, "build", "nested"), { recursive: true });
+    symlinkSync("missing", join(root, "build", "nested", "link"));
+    assertBlocked(
+      () => collectFiles(realpathSync(root)),
+      /symbolic link is dangling: build[\\/]nested[\\/]link/i,
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles skips aliases to fully ignored directory targets", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-ignored-alias-"));
+  const outside = mkdtempSync(join(tmpdir(), "savept-policy-ignored-outside-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    for (const directory of [".git", "node_modules"]) {
+      mkdirSync(join(root, directory), { recursive: true });
+      symlinkSync(outside, join(root, directory, "escaping"), "dir");
+      symlinkSync(
+        directory,
+        join(root, `alias-${directory.replace(".", "")}`),
+        "dir",
+      );
+    }
+    assert.doesNotThrow(() => collectFiles(realpathSync(root)));
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+    rmSync(outside, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles inventories only manifests through aliases to excluded build targets", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-build-alias-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    mkdirSync(join(root, "dist"), { recursive: true });
+    writeFileSync(join(root, "dist", "bad.ts"), 'import "@savept/private";');
+    symlinkSync("dist", join(root, "alias"), "dir");
+    assert.doesNotThrow(() => collectFiles(realpathSync(root)));
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles inventories manifests through aliases to excluded generated targets", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-generated-alias-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    mkdirSync(join(root, "generated", "hidden"), { recursive: true });
+    writeFileSync(
+      join(root, "generated", "hidden", "package.json"),
+      manifest("@savept/hidden"),
+    );
+    symlinkSync("generated", join(root, "alias"), "dir");
+    assert.ok(
+      collectFiles(realpathSync(root)).some(
+        (file) => file.path === "generated/hidden/package.json",
+      ),
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles safely skips a valid direct excluded symlink cycle", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-excluded-cycle-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    symlinkSync(".", join(root, "generated"), "dir");
+    assert.doesNotThrow(() => collectFiles(realpathSync(root)));
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles blocks aliases that resolve outside the repository", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-external-alias-"));
+  const outside = mkdtempSync(join(tmpdir(), "savept-policy-outside-"));
+  try {
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    symlinkSync(outside, join(root, "alias"), "dir");
+    assertBlocked(
+      () => collectFiles(realpathSync(root)),
+      /symbolic link escapes repository: alias/i,
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+    rmSync(outside, { force: true, recursive: true });
+  }
+});
+
+test("policy test script and CI policy-test step are kept in order", () => {
+  const repositoryRoot = new URL("../..", import.meta.url);
+  const packageJson = JSON.parse(
+    readFileSync(new URL("package.json", repositoryRoot), "utf8"),
+  );
+  const workflow = readFileSync(
+    new URL(".github/workflows/ci.yml", repositoryRoot),
+    "utf8",
+  );
+  assert.equal(
+    packageJson.scripts["test:policy"],
+    "node --test tools/policy/validate.test.mjs",
+  );
+  assert.match(
+    workflow,
+    /- name: Test workspace and dependency policy\n\s+run: pnpm test:policy/,
+  );
+  const policyCheck = workflow.indexOf("run: pnpm policy:check");
+  const policyTest = workflow.indexOf("run: pnpm test:policy");
+  const formatting = workflow.indexOf("run: pnpm format:check");
+  assert.ok(policyCheck < policyTest && policyTest < formatting);
 });
 
 test("validatePolicy requires imported local packages to be declared", () => {

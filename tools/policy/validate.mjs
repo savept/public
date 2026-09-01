@@ -1020,9 +1020,31 @@ function discoverWorkspace(realRoot) {
   });
 }
 
-function collectFiles(realRoot) {
+export function collectFiles(realRoot) {
   const files = [];
   const visitedDirectories = new Set([realRoot]);
+  function resolveSymbolicLink(absolute, relative) {
+    try {
+      return realpathSync(absolute);
+    } catch (error) {
+      if (error?.code === "ENOENT")
+        block(`symbolic link is dangling: ${relative}`);
+      block(`symbolic link cannot be resolved: ${relative}`);
+    }
+  }
+  function targetExclusion(target) {
+    const relativeTarget = path.relative(realRoot, target);
+    const segments = relativeTarget.split(path.sep);
+    if (segments.some((segment) => MANIFEST_EXCLUDED_DIRECTORIES.has(segment)))
+      return { manifestsOnly: false, relativeTarget, skip: true };
+    return {
+      manifestsOnly: segments.some((segment) =>
+        EXCLUDED_DIRECTORIES.has(segment),
+      ),
+      relativeTarget,
+      skip: false,
+    };
+  }
   function walk(
     directory,
     relativeDirectory,
@@ -1030,10 +1052,12 @@ function collectFiles(realRoot) {
     manifestsOnly = false,
   ) {
     const canonical = realpathSync(directory);
-    if (!isRoot && visitedDirectories.has(canonical))
+    if (!isRoot && visitedDirectories.has(canonical)) {
+      if (manifestsOnly) return;
       block(
         `symbolic link creates a directory cycle or duplicate traversal: ${relativeDirectory}`,
       );
+    }
     visitedDirectories.add(canonical);
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const relative = relativeDirectory
@@ -1041,15 +1065,24 @@ function collectFiles(realRoot) {
         : entry.name;
       const absolute = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) {
-        const target = realpathSync(absolute);
+        const target = resolveSymbolicLink(absolute, relative);
         if (!isWithin(realRoot, target))
           block(`symbolic link escapes repository: ${relative}`);
-        if (MANIFEST_EXCLUDED_DIRECTORIES.has(entry.name)) continue;
+        const exclusion = targetExclusion(target);
+        if (MANIFEST_EXCLUDED_DIRECTORIES.has(entry.name) || exclusion.skip)
+          continue;
         const stats = lstatSync(target);
         const targetManifestsOnly =
-          manifestsOnly || EXCLUDED_DIRECTORIES.has(entry.name);
+          manifestsOnly ||
+          EXCLUDED_DIRECTORIES.has(entry.name) ||
+          exclusion.manifestsOnly;
         if (stats.isDirectory())
-          walk(target, relative, false, targetManifestsOnly);
+          walk(
+            target,
+            exclusion.manifestsOnly ? exclusion.relativeTarget : relative,
+            false,
+            targetManifestsOnly,
+          );
         else if (
           stats.isFile() &&
           (!targetManifestsOnly || isPackageManifest(relative))
