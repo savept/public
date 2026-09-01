@@ -28,6 +28,7 @@ const EXCLUDED_DIRECTORIES = new Set([
   "generated",
   "__generated__",
 ]);
+const MANIFEST_EXCLUDED_DIRECTORIES = new Set([".git", "node_modules"]);
 const DEPENDENCY_FIELDS = [
   "dependencies",
   "devDependencies",
@@ -200,6 +201,16 @@ function isExcluded(relativePath) {
     .some((segment) => EXCLUDED_DIRECTORIES.has(segment));
 }
 
+function isManifestExcluded(relativePath) {
+  return relativePath
+    .split(path.sep)
+    .some((segment) => MANIFEST_EXCLUDED_DIRECTORIES.has(segment));
+}
+
+function isPackageManifest(relativePath) {
+  return path.basename(relativePath) === "package.json";
+}
+
 function normalizeFiles(root, files) {
   const normalized = new Map();
   for (const file of files) {
@@ -216,7 +227,12 @@ function normalizeFiles(root, files) {
     if (!isWithin(root, absolute))
       block(`file inventory path escapes repository: ${file.path}`);
     const relative = path.relative(root, absolute);
-    if (isExcluded(relative)) continue;
+    if (
+      isExcluded(relative) &&
+      (!isPackageManifest(relative) || isManifestExcluded(relative))
+    ) {
+      continue;
+    }
     if (normalized.has(relative))
       block(`file inventory contains duplicate path: ${relative}`);
     normalized.set(relative, file.content);
@@ -705,7 +721,6 @@ function validateTsconfig({
   content,
   packages,
   manifestsByName,
-  projectReferences,
 }) {
   const parsed = ts.parseConfigFileTextToJson(configPath, content);
   if (parsed.error) {
@@ -731,19 +746,6 @@ function validateTsconfig({
   if (config.references !== undefined) {
     if (!Array.isArray(config.references))
       block(`tsconfig references in ${configPath} must be an array`);
-    for (const reference of config.references) {
-      const resolved = resolveConfigPath(
-        repositoryRoot,
-        configPath,
-        reference?.path,
-        "reference path",
-      );
-      recordWorkspaceEdge(
-        projectReferences,
-        configOwner,
-        owningPackage(packages, resolved),
-      );
-    }
   }
   const compilerOptions = config.compilerOptions ?? {};
   let pathsBase = path.dirname(path.join(repositoryRoot, configPath));
@@ -794,6 +796,44 @@ function validateTsconfig({
         }
       }
     }
+  }
+  return { config, owner: configOwner };
+}
+
+function validateProjectReferences({
+  repositoryRoot,
+  configPath,
+  config,
+  owner,
+  packages,
+  validatedTsconfigs,
+  projectReferences,
+}) {
+  if (config.references === undefined) return;
+  for (const reference of config.references) {
+    const resolved = resolveConfigPath(
+      repositoryRoot,
+      configPath,
+      reference?.path,
+      "reference path",
+    );
+    const targetConfigPath =
+      path.extname(resolved).toLowerCase() === ".json"
+        ? resolved
+        : path.join(resolved, "tsconfig.json");
+    const relativeTargetPath = path.relative(repositoryRoot, targetConfigPath);
+    const target = validatedTsconfigs.get(relativeTargetPath);
+    if (!target) {
+      block(
+        `tsconfig project reference does not resolve to an inventoried tsconfig in ${configPath}: ${reference.path}`,
+      );
+    }
+    if (!target.owner || !owningPackage(packages, targetConfigPath)) {
+      block(
+        `tsconfig project reference must resolve to a workspace package config in ${configPath}: ${reference.path}`,
+      );
+    }
+    recordWorkspaceEdge(projectReferences, owner, target.owner);
   }
 }
 
@@ -881,18 +921,31 @@ export function validatePolicy({
     }
   }
 
+  const validatedTsconfigs = new Map();
+  for (const [filePath, content] of inventory) {
+    if (!/^tsconfig.*\.json$/.test(path.basename(filePath))) continue;
+    const validated = validateTsconfig({
+      repositoryRoot,
+      configPath: filePath,
+      content,
+      packages: manifestsByPath,
+      manifestsByName,
+    });
+    validatedTsconfigs.set(filePath, validated);
+  }
+  for (const [filePath, validated] of validatedTsconfigs) {
+    validateProjectReferences({
+      repositoryRoot,
+      configPath: filePath,
+      ...validated,
+      packages: manifestsByPath,
+      validatedTsconfigs,
+      projectReferences,
+    });
+  }
+
   for (const [filePath, content] of inventory) {
     const absolute = path.join(repositoryRoot, filePath);
-    if (/^tsconfig.*\.json$/.test(path.basename(filePath))) {
-      validateTsconfig({
-        repositoryRoot,
-        configPath: filePath,
-        content,
-        packages: manifestsByPath,
-        manifestsByName,
-        projectReferences,
-      });
-    }
     if (!SOURCE_EXTENSIONS.some((extension) => filePath.endsWith(extension)))
       continue;
     const owner = manifestsByPath.find((entry) =>
@@ -970,7 +1023,12 @@ function discoverWorkspace(realRoot) {
 function collectFiles(realRoot) {
   const files = [];
   const visitedDirectories = new Set([realRoot]);
-  function walk(directory, relativeDirectory, isRoot = false) {
+  function walk(
+    directory,
+    relativeDirectory,
+    isRoot = false,
+    manifestsOnly = false,
+  ) {
     const canonical = realpathSync(directory);
     if (!isRoot && visitedDirectories.has(canonical))
       block(
@@ -981,19 +1039,34 @@ function collectFiles(realRoot) {
       const relative = relativeDirectory
         ? path.join(relativeDirectory, entry.name)
         : entry.name;
-      if (entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name)) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) {
         const target = realpathSync(absolute);
         if (!isWithin(realRoot, target))
           block(`symbolic link escapes repository: ${relative}`);
+        if (MANIFEST_EXCLUDED_DIRECTORIES.has(entry.name)) continue;
         const stats = lstatSync(target);
-        if (stats.isDirectory()) walk(target, relative);
-        else if (stats.isFile())
+        const targetManifestsOnly =
+          manifestsOnly || EXCLUDED_DIRECTORIES.has(entry.name);
+        if (stats.isDirectory())
+          walk(target, relative, false, targetManifestsOnly);
+        else if (
+          stats.isFile() &&
+          (!targetManifestsOnly || isPackageManifest(relative))
+        )
           files.push({ path: relative, content: readFileSync(target, "utf8") });
       } else if (entry.isDirectory()) {
-        walk(absolute, relative);
-      } else if (entry.isFile()) {
+        if (MANIFEST_EXCLUDED_DIRECTORIES.has(entry.name)) continue;
+        walk(
+          absolute,
+          relative,
+          false,
+          manifestsOnly || EXCLUDED_DIRECTORIES.has(entry.name),
+        );
+      } else if (
+        entry.isFile() &&
+        (!manifestsOnly || isPackageManifest(relative))
+      ) {
         files.push({ path: relative, content: readFileSync(absolute, "utf8") });
       }
     }

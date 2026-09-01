@@ -51,10 +51,13 @@ function packageManifest(name, extra = {}) {
 }
 
 function referencePackageB() {
-  return {
-    path: "packages/a/tsconfig.json",
-    content: '{ "references": [{ "path": "../b" }] }',
-  };
+  return [
+    {
+      path: "packages/a/tsconfig.json",
+      content: '{ "references": [{ "path": "../b" }] }',
+    },
+    { path: "packages/b/tsconfig.json", content: "{}" },
+  ];
 }
 
 function baseFixture({
@@ -606,7 +609,7 @@ test("validatePolicy accepts declared static require.resolve exports", () => {
             content:
               'require.resolve("@savept/b/feature"); require(require.resolve("@savept/b/feature"));',
           },
-          referencePackageB(),
+          ...referencePackageB(),
         ],
       }),
     ),
@@ -992,6 +995,23 @@ test("validatePolicy ignores only excluded and explicit generated directories", 
   );
 });
 
+test("validatePolicy inventories package manifests below excluded build trees", () => {
+  assertBlocked(
+    () =>
+      validatePolicy(
+        baseFixture({
+          extraFiles: [
+            {
+              path: "dist/hidden/package.json",
+              content: manifest("@savept/hidden"),
+            },
+          ],
+        }),
+      ),
+    /package\.json is missing from workspace discovery: dist\/hidden\/package\.json/i,
+  );
+});
+
 test("validatePolicy blocks escaped relative source paths and protocols", () => {
   for (const specifier of [
     "../../../../private/index.js",
@@ -1105,7 +1125,7 @@ test("validatePolicy accepts declared workspace imports through exports", () => 
             content:
               'import root from "@savept/b"; export { feature } from "@savept/b/feature";',
           },
-          referencePackageB(),
+          ...referencePackageB(),
         ],
       }),
     ),
@@ -1124,6 +1144,23 @@ test("validatePolicy requires project references for imported workspace dependen
     /project reference/i,
   );
   assert.doesNotThrow(() => validatePolicy(baseFixture({ packageA })));
+  assertBlocked(
+    () =>
+      validatePolicy(
+        baseFixture({
+          packageA,
+          extraFiles: [
+            importedSource,
+            {
+              path: "packages/a/tsconfig.json",
+              content: '{ "references": [{ "path": "../b/src" }] }',
+            },
+            { path: "packages/b/tsconfig.json", content: "{}" },
+          ],
+        }),
+      ),
+    /project reference.*tsconfig/i,
+  );
   assert.doesNotThrow(() =>
     validatePolicy(
       baseFixture({
@@ -1134,6 +1171,38 @@ test("validatePolicy requires project references for imported workspace dependen
             path: "packages/a/tsconfig.json",
             content: '{ "references": [{ "path": "../b" }] }',
           },
+          { path: "packages/b/tsconfig.json", content: "{}" },
+        ],
+      }),
+    ),
+  );
+  assert.doesNotThrow(() =>
+    validatePolicy(
+      baseFixture({
+        packageA,
+        extraFiles: [
+          importedSource,
+          {
+            path: "packages/a/tsconfig.json",
+            content: '{ "references": [{ "path": "../b/config.v1" }] }',
+          },
+          { path: "packages/b/config.v1/tsconfig.json", content: "{}" },
+        ],
+      }),
+    ),
+  );
+  assert.doesNotThrow(() =>
+    validatePolicy(
+      baseFixture({
+        packageA,
+        extraFiles: [
+          importedSource,
+          {
+            path: "packages/a/tsconfig.json",
+            content:
+              '{ "references": [{ "path": "../b/tsconfig.build.json" }] }',
+          },
+          { path: "packages/b/tsconfig.build.json", content: "{}" },
         ],
       }),
     ),
@@ -1342,7 +1411,7 @@ test("validatePolicy supports exact, wildcard, conditional, array, and nested ex
             content:
               'import "@savept/b/exact"; import "@savept/b/features/one";',
           },
-          referencePackageB(),
+          ...referencePackageB(),
         ],
       }),
     ),
@@ -1410,7 +1479,7 @@ test("validatePolicy accepts a broad wildcard export when not excluded", () => {
             path: "packages/a/src/index.ts",
             content: 'import "@savept/b/feature/public";',
           },
-          referencePackageB(),
+          ...referencePackageB(),
         ],
       }),
     ),
