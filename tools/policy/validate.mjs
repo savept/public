@@ -953,6 +953,20 @@ export function validatePolicy({
     );
     if (!owner)
       block(`source file is not owned by a workspace package: ${filePath}`);
+    let canonicalAbsolute;
+    try {
+      canonicalAbsolute = realpathSync(absolute);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR")
+        block(`source file cannot be resolved: ${filePath}`);
+    }
+    const canonicalOwner = canonicalAbsolute
+      ? manifestsByPath.find((entry) => isWithin(entry.path, canonicalAbsolute))
+      : owner;
+    if (canonicalOwner && canonicalOwner.path !== owner.path)
+      block(
+        `source file symlink crosses a workspace package boundary in ${filePath}`,
+      );
     for (const specifier of sourceSpecifiers(content, filePath)) {
       validateSpecifier({
         specifier,

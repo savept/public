@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { test } from "node:test";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   checkToolchain,
@@ -126,6 +126,13 @@ function temporaryFilesystemFixture(root, packageB = {}) {
       },
     ],
   };
+}
+function materializeFixture(fixture) {
+  for (const file of fixture.files) {
+    const absolute = join(fixture.root, file.path);
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, file.content);
+  }
 }
 
 function assertBlocked(callback, fragment) {
@@ -1496,6 +1503,126 @@ test("collectFiles blocks aliases that resolve outside the repository", () => {
   } finally {
     rmSync(root, { force: true, recursive: true });
     rmSync(outside, { force: true, recursive: true });
+  }
+});
+
+test("validatePolicy blocks source file symlinks crossing package boundaries", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-file-link-boundary-"));
+  try {
+    const fixtureRoot = realpathSync(root);
+    const fixture = temporaryFilesystemFixture(fixtureRoot);
+    materializeFixture(fixture);
+    mkdirSync(join(root, "packages", "a", "src"), { recursive: true });
+    mkdirSync(join(root, "packages", "b", "src"), { recursive: true });
+    writeFileSync(
+      join(root, "packages", "b", "src", "private.ts"),
+      "export const secret = 1;\n",
+    );
+    symlinkSync(
+      "../../b/src/private.ts",
+      join(root, "packages", "a", "src", "private.ts"),
+      "file",
+    );
+    writeFileSync(
+      join(root, "packages", "a", "src", "index.ts"),
+      'import "./private.ts";\n',
+    );
+    assertBlocked(
+      () =>
+        validatePolicy({
+          ...fixture,
+          files: collectFiles(fixtureRoot),
+        }),
+      /source file symlink.*package boundary|canonical.*package/i,
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("validatePolicy permits source file symlinks within one package", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-file-link-safe-"));
+  try {
+    const fixtureRoot = realpathSync(root);
+    const fixture = temporaryFilesystemFixture(fixtureRoot);
+    materializeFixture(fixture);
+    mkdirSync(join(root, "packages", "a", "src"), { recursive: true });
+    writeFileSync(
+      join(root, "packages", "a", "src", "shared.ts"),
+      "export const shared = 1;\n",
+    );
+    symlinkSync(
+      "shared.ts",
+      join(root, "packages", "a", "src", "shared-link.ts"),
+      "file",
+    );
+    writeFileSync(
+      join(root, "packages", "a", "src", "index.ts"),
+      'import "./shared-link.ts";\n',
+    );
+    assert.doesNotThrow(() =>
+      validatePolicy({
+        ...fixture,
+        files: collectFiles(fixtureRoot),
+      }),
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("collectFiles blocks external and dangling source file symlinks", () => {
+  const root = mkdtempSync(join(tmpdir(), "savept-policy-file-link-errors-"));
+  const outside = mkdtempSync(
+    join(tmpdir(), "savept-policy-file-link-outside-"),
+  );
+  try {
+    mkdirSync(join(root, "packages", "a", "src"), { recursive: true });
+    writeFileSync(join(root, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(root, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    writeFileSync(join(outside, "private.ts"), "export {};\n");
+    symlinkSync(
+      join(outside, "private.ts"),
+      join(root, "packages", "a", "src", "external.ts"),
+      "file",
+    );
+    assertBlocked(
+      () => collectFiles(realpathSync(root)),
+      /symbolic link escapes repository: packages[\\/]a[\\/]src[\\/]external\.ts/i,
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+    rmSync(outside, { force: true, recursive: true });
+  }
+
+  const danglingRoot = mkdtempSync(
+    join(tmpdir(), "savept-policy-file-link-dangling-"),
+  );
+  try {
+    mkdirSync(join(danglingRoot, "packages", "a", "src"), {
+      recursive: true,
+    });
+    writeFileSync(join(danglingRoot, ".tool-versions"), toolVersions);
+    writeFileSync(
+      join(danglingRoot, "package.json"),
+      manifest("@savept/public-workspace"),
+    );
+    writeFileSync(join(danglingRoot, "pnpm-workspace.yaml"), "packages: []\n");
+    symlinkSync(
+      "missing.ts",
+      join(danglingRoot, "packages", "a", "src", "dangling.ts"),
+      "file",
+    );
+    assertBlocked(
+      () => collectFiles(realpathSync(danglingRoot)),
+      /symbolic link is dangling: packages[\\/]a[\\/]src[\\/]dangling\.ts/i,
+    );
+  } finally {
+    rmSync(danglingRoot, { force: true, recursive: true });
   }
 });
 
