@@ -679,6 +679,8 @@ function validateWorkflowDocument(name, source) {
   ]);
   const allowedRuns = new Set([
     "pnpm install --frozen-lockfile",
+    "pnpm policy:check",
+    "pnpm test:policy",
     "pnpm format:check",
     "pnpm check",
     "pnpm release:validate",

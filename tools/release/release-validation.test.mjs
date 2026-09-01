@@ -521,6 +521,65 @@ describe("release validation", () => {
     );
   });
 
+  it("allows the workspace policy check without granting publication authority", () => {
+    const workspaceRoot = createWorkspace();
+    const workflowsRoot = join(workspaceRoot, ".github", "workflows");
+    mkdirSync(workflowsRoot, { recursive: true });
+    mkdirSync(join(workspaceRoot, "release"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, "release", "trusted-publishing-policy.json"),
+      JSON.stringify({
+        futurePublishJob: {
+          allowListGate: true,
+          environment: "npm-production",
+          protectedEnvironmentReview: true,
+          provenanceArgs: ["publish", "--provenance"],
+          scopedPermissions: ["contents: read", "id-token: write"],
+        },
+        validationOnly: true,
+        version: 1,
+      }),
+    );
+
+    const workflow = (permissions, steps) =>
+      `on: [push]\npermissions:\n${permissions}\njobs:\n  validate:\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps:\n${steps}`;
+    const policyStep =
+      "      - run: pnpm policy:check\n      - run: pnpm test:policy\n";
+
+    writeFileSync(
+      join(workflowsRoot, "ci.yml"),
+      workflow("  contents: read\n", policyStep),
+    );
+    expect(validateWorkflowPolicy(workspaceRoot)).toEqual([]);
+
+    writeFileSync(
+      join(workflowsRoot, "ci.yml"),
+      workflow("  contents: read\n", `${policyStep}      - run: npm publish\n`),
+    );
+    expect(validateWorkflowPolicy(workspaceRoot)).toContain(
+      "workflow ci.yml has publication authority",
+    );
+
+    writeFileSync(
+      join(workflowsRoot, "ci.yml"),
+      workflow("  contents: read\n  id-token: write\n", policyStep),
+    );
+    expect(validateWorkflowPolicy(workspaceRoot)).toContain(
+      "ordinary CI must use contents: read only",
+    );
+
+    writeFileSync(
+      join(workflowsRoot, "ci.yml"),
+      workflow(
+        "  contents: read\n",
+        "      - run: pnpm policy:check\n        env:\n          NODE_AUTH_TOKEN: secret\n",
+      ),
+    );
+    expect(validateWorkflowPolicy(workspaceRoot)).toContain(
+      "workflow ci.yml has unsupported configuration",
+    );
+  });
+
   it("rejects a second workflow with publication authority", () => {
     const workspaceRoot = createWorkspace();
     mkdirSync(join(workspaceRoot, ".github", "workflows"), { recursive: true });
